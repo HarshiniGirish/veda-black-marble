@@ -109,12 +109,12 @@ def download_data(
         custom_filter=custom_filter,
         use_cache=True,
         cache_dir=data_path / "osm_cache",
+        source=(config.acquisition.osm_source if config else None),
     )
 
     logger.info(
-        "OSM road network downloaded: %d nodes, %d edges",
-        len(road_network.nodes),
-        len(road_network.edges),
+        "OSM road segments downloaded: %d",
+        len(road_network),
     )
 
     return {
@@ -323,7 +323,7 @@ def process_landsat(
 
 
 def process_roads(
-    road_network: Any,
+    road_segments: Any,
     bbox: BBox,
     reference_transform: Affine,
     processing_crs: Any,
@@ -335,13 +335,9 @@ def process_roads(
     sigmas = config.analysis.urban_field_sigmas if config else None
     weights = config.analysis.urban_field_weights if config else None
 
-    logger.info(
-        "Processing roads: %d nodes, %d edges",
-        len(road_network.nodes),
-        len(road_network.edges),
-    )
+    logger.info("Processing roads: %d segments", len(road_segments))
     roads_fractional = buffer_and_rasterize_roads_fractional(
-        graph=road_network,
+        roads_gdf=road_segments,
         bbox=bbox,
         transform=reference_transform,
         crs=processing_crs,
