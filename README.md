@@ -150,7 +150,9 @@ The pipeline produces:
 
 ## License
 
-[Apache License 2.0](LICENSE)
+[Apache License 2.0](LICENSE) - National Aeronautics and Space Administration (NASA)
+
+Originally created by NASA Goddard Earth Sciences
 
 ## Contributing
 
