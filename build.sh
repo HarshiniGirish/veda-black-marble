@@ -26,3 +26,4 @@ fi
 echo "Verifying blackmarble CLI"
 "${conda}" run --name "${CONDA_ENV_NAME}" blackmarble --help >/dev/null
 echo "Build complete"
+chmod +x "$(cd "$(dirname "$0")" && pwd)/run.sh" 2>/dev/null || true
