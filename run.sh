@@ -1,4 +1,4 @@
-#!/usr/bin/env -S bash --login
+#!/usr/bin/env bash
 set -euo pipefail
 
 # MAAP OGC / DPS entrypoint for VEDA Black Marble.
@@ -8,8 +8,7 @@ set -euo pipefail
 #   ./run.sh --bbox "-122.55,37.69,-122.32,37.81" --date 2023-06-15
 #
 # Positional (MAAP Register Algorithm UI / DPS):
-#   ./run.sh <bbox> <date> [config] [osm_source] [wgs84] [basename]
-#   Pass "" for unused optional slots.
+#   ./run.sh <bbox> <date> [config] [osm_source] [wgs84] [basename] [earthdata_token]
 
 basedir=$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)
 
@@ -24,11 +23,19 @@ BASENAME="black_marble_output"
 LOG_LEVEL="INFO"
 EARTHDATA_TOKEN="${EARTHDATA_TOKEN:-}"
 
+# Trim leading/trailing whitespace (DPS/CWL sometimes adds spaces)
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
 usage() {
   cat <<EOF
 Usage:
   $(basename "$0") --bbox MINX,MINY,MAXX,MAXY --date YYYY-MM-DD [options...]
-  $(basename "$0") <bbox> <date> [config] [osm_source] [wgs84] [basename]
+  $(basename "$0") <bbox> <date> [config] [osm_source] [wgs84] [basename] [earthdata_token]
 
 Options:
   --bbox BBOX              WGS84 bbox: min_lon,min_lat,max_lon,max_lat
@@ -49,6 +56,7 @@ if [[ $# -gt 0 && "${1}" != --* ]]; then
   OSM_SOURCE="${4:-$OSM_SOURCE}"
   WGS84="${5:-$WGS84}"
   BASENAME="${6:-$BASENAME}"
+  EARTHDATA_TOKEN="${7:-$EARTHDATA_TOKEN}"
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -69,6 +77,15 @@ else
     esac
   done
 fi
+
+BBOX="$(trim "$BBOX")"
+DATE="$(trim "$DATE")"
+CONFIG="$(trim "$CONFIG")"
+OSM_SOURCE="$(trim "$OSM_SOURCE")"
+WGS84="$(trim "$WGS84")"
+BASENAME="$(trim "$BASENAME")"
+EARTHDATA_TOKEN="$(trim "$EARTHDATA_TOKEN")"
+LOG_LEVEL="$(trim "$LOG_LEVEL")"
 
 if [[ -z "${BBOX}" || -z "${DATE}" ]]; then
   echo "ERROR: --bbox and --date are required" >&2
@@ -107,19 +124,49 @@ esac
 
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-notebook}"
 
+# Initialize conda for non-interactive DPS/CWL shells (login profile is often skipped)
+if ! command -v conda >/dev/null 2>&1; then
+  for candidate in \
+    "${CONDA_EXE:-}" \
+    /opt/conda/etc/profile.d/conda.sh \
+    /opt/conda/bin/conda \
+    /usr/local/etc/profile.d/conda.sh \
+    "${HOME}/.conda/etc/profile.d/conda.sh" \
+    /srv/conda/etc/profile.d/conda.sh \
+    /srv/conda/bin/conda
+  do
+    [[ -z "${candidate}" ]] && continue
+    if [[ -f "${candidate}" && "${candidate}" == *.sh ]]; then
+      # shellcheck disable=SC1090
+      source "${candidate}"
+      break
+    elif [[ -x "${candidate}" ]]; then
+      export PATH="$(dirname "${candidate}"):${PATH}"
+      break
+    fi
+  done
+fi
+
+if ! command -v conda >/dev/null 2>&1; then
+  echo "ERROR: conda not found in PATH. Checked common MAAP locations." >&2
+  echo "PATH=${PATH}" >&2
+  type -a conda 2>&1 || true
+  ls /opt/conda/bin 2>&1 | head || true
+  ls /srv/conda/bin 2>&1 | head || true
+  exit 127
+fi
+
 echo "Running Black Marble pipeline"
 echo "  bbox=${BBOX}"
 echo "  date=${DATE}"
 echo "  config=${CONFIG}"
 echo "  osm_source=${OSM_SOURCE}"
 echo "  output=${OUTPUT_PATH}"
+echo "  conda=$(command -v conda) env=${CONDA_ENV_NAME}"
 
-if command -v conda >/dev/null 2>&1; then
-  conda run --live-stream --name "${CONDA_ENV_NAME}" \
-    blackmarble "${ARGS[@]}"
-else
+# Always run via conda (matches MAAP OGC / sardem-sarsen pattern)
+conda run --live-stream --name "${CONDA_ENV_NAME}" \
   blackmarble "${ARGS[@]}"
-fi
 
 echo "Done. Products in ./output"
 ls -la output || true
