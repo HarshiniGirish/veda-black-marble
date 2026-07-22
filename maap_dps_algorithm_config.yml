@@ -1,0 +1,44 @@
+# MAAP DPS / Register Algorithm UI style config
+# Use with: maap.register_algorithm_from_yaml_file(...)
+algorithm_description: >
+  VEDA Black Marble nighttime lights processing. Combines VIIRS VNP46A2,
+  Landsat, and OSM roads into an urban-focused Cloud-Optimized GeoTIFF for
+  a bbox and date.
+algorithm_name: veda-black-marble
+algorithm_version: main
+repository_url: https://github.com/HarshiniGirish/veda-black-marble-ogc.git
+docker_container_url: mas.maap-project.org/root/maap-workspaces/custom_images/maap_base:v6.0.0
+disk_space: 40GB
+queue: maap-dps-worker-16gb
+# Paths relative to the cloned repo root as DPS sees them.
+# If this packaging lives at the repo root of a fork named veda-black-marble-ogc:
+build_command: veda-black-marble-ogc/build.sh
+run_command: veda-black-marble-ogc/run.sh
+inputs:
+  config: []
+  file: []
+  positional:
+    - name: bbox
+      description: Bounding box min_lon,min_lat,max_lon,max_lat (WGS84)
+      default: "-122.55,37.69,-122.32,37.81"
+      required: true
+    - name: date
+      description: Target date YYYY-MM-DD
+      default: "2023-06-15"
+      required: true
+    - name: config
+      description: Preset default | high_quality | fast
+      default: "fast"
+      required: false
+    - name: osm_source
+      description: overpass or layercake
+      default: "overpass"
+      required: false
+    - name: wgs84
+      description: Also export EPSG:4326 (true/false)
+      default: "false"
+      required: false
+    - name: basename
+      description: Output filename stem
+      default: "black_marble_output"
+      required: false
