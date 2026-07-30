@@ -1,25 +1,28 @@
 # MAAP DPS / Register Algorithm UI style config
 # Use with: maap.register_algorithm_from_yaml_file(...)
+#
+# Earthdata auth: do NOT register the token as a job input (it appears in logs).
+# Users store it once via MAAP Secrets:
+#   MAAP().secrets.add_secret("EARTHDATA_TOKEN", "<token>")
 algorithm_description: >
   VEDA Black Marble nighttime lights processing. Combines VIIRS VNP46A2,
   Landsat, and OSM roads into an urban-focused Cloud-Optimized GeoTIFF for
-  a bbox and date.
+  a bbox and date. Earthdata credentials are loaded from MAAP Secrets
+  (default secret name EARTHDATA_TOKEN), not from CLI args.
 algorithm_name: veda-black-marble
 algorithm_version: main
-repository_url: https://github.com/HarshiniGirish/veda-black-marble-ogc.git
+repository_url: https://github.com/HarshiniGirish/veda-black-marble.git
 docker_container_url: mas.maap-project.org/root/maap-workspaces/custom_images/maap_base:v6.0.0
 disk_space: 40GB
 queue: maap-dps-worker-16gb
-# Paths relative to the cloned repo root as DPS sees them.
-# If this packaging lives at the repo root of a fork named veda-black-marble-ogc:
-build_command: veda-black-marble-ogc/build.sh
-run_command: veda-black-marble-ogc/run.sh
+build_command: veda-black-marble/build.sh
+run_command: veda-black-marble/run.sh
 inputs:
   config: []
   file: []
   positional:
     - name: bbox
-      description: Bounding box min_lon,min_lat,max_lon,max_lat (WGS84)
+      description: Bounding box min_lon,min_lat,max_lon,max_lat (WGS84). Lat span must be >= 0.05 deg.
       default: "-122.55,37.69,-122.32,37.81"
       required: true
     - name: date
@@ -39,6 +42,14 @@ inputs:
       default: "false"
       required: false
     - name: basename
-      description: Output filename stem
+      description: >
+        Output filename stem written as output/<basename>.tif.
+        Equivalent to blackmarble --output-path output/<basename>.tif
       default: "black_marble_output"
+      required: false
+    - name: earthdata_secret_name
+      description: >
+        MAAP Secrets Manager name that holds the Earthdata token
+        (not the token value). Default EARTHDATA_TOKEN.
+      default: "EARTHDATA_TOKEN"
       required: false
