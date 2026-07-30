@@ -4,11 +4,14 @@ set -euo pipefail
 # MAAP OGC / DPS entrypoint for VEDA Black Marble.
 # Persistable products must land under ./output (DPS convention).
 #
+# Earthdata auth: DO NOT pass the token on the CLI (it appears in DPS job logs).
+# Resolve via MAAP Secrets (maap-py) or an already-exported EARTHDATA_TOKEN env var.
+#
 # Named flags (OGC app pack / local):
 #   ./run.sh --bbox "-122.55,37.69,-122.32,37.81" --date 2023-06-15
 #
 # Positional (MAAP Register Algorithm UI / DPS):
-#   ./run.sh <bbox> <date> [config] [osm_source] [wgs84] [basename] [earthdata_token]
+#   ./run.sh <bbox> <date> [config] [osm_source] [wgs84] [basename] [earthdata_secret_name]
 
 basedir=$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)
 
@@ -21,7 +24,7 @@ OSM_SOURCE="overpass"
 WGS84="false"
 BASENAME="black_marble_output"
 LOG_LEVEL="INFO"
-EARTHDATA_TOKEN="${EARTHDATA_TOKEN:-}"
+EARTHDATA_SECRET_NAME="${EARTHDATA_SECRET_NAME:-EARTHDATA_TOKEN}"
 
 # Trim leading/trailing whitespace (DPS/CWL sometimes adds spaces)
 trim() {
@@ -35,17 +38,20 @@ usage() {
   cat <<EOF
 Usage:
   $(basename "$0") --bbox MINX,MINY,MAXX,MAXY --date YYYY-MM-DD [options...]
-  $(basename "$0") <bbox> <date> [config] [osm_source] [wgs84] [basename] [earthdata_token]
+  $(basename "$0") <bbox> <date> [config] [osm_source] [wgs84] [basename] [earthdata_secret_name]
 
 Options:
-  --bbox BBOX              WGS84 bbox: min_lon,min_lat,max_lon,max_lat
-  --date YYYY-MM-DD        Target date
-  --config PRESET          default | high_quality | fast  [default: fast]
-  --osm_source SRC         overpass | layercake           [default: overpass]
-  --wgs84 true|false       Also export EPSG:4326          [default: false]
-  --basename NAME          Output filename stem           [default: black_marble_output]
-  --log_level LEVEL        DEBUG|INFO|WARNING|ERROR       [default: INFO]
-  --earthdata_token TOKEN  NASA Earthdata token (or set EARTHDATA_TOKEN)
+  --bbox BBOX                    WGS84 bbox: min_lon,min_lat,max_lon,max_lat
+  --date YYYY-MM-DD              Target date
+  --config PRESET                default | high_quality | fast  [default: fast]
+  --osm_source SRC               overpass | layercake           [default: overpass]
+  --wgs84 true|false             Also export EPSG:4326          [default: false]
+  --basename NAME                Output filename stem → output/NAME.tif
+                                 (maps to blackmarble --output-path)
+  --log_level LEVEL              DEBUG|INFO|WARNING|ERROR       [default: INFO]
+  --earthdata_secret_name NAME   MAAP secret name holding the Earthdata token
+                                 [default: EARTHDATA_TOKEN]
+                                 Never pass the token value itself on the CLI.
 EOF
 }
 
@@ -56,7 +62,7 @@ if [[ $# -gt 0 && "${1}" != --* ]]; then
   OSM_SOURCE="${4:-$OSM_SOURCE}"
   WGS84="${5:-$WGS84}"
   BASENAME="${6:-$BASENAME}"
-  EARTHDATA_TOKEN="${7:-$EARTHDATA_TOKEN}"
+  EARTHDATA_SECRET_NAME="${7:-$EARTHDATA_SECRET_NAME}"
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -67,7 +73,13 @@ else
       --wgs84) WGS84="$2"; shift 2 ;;
       --basename) BASENAME="$2"; shift 2 ;;
       --log_level) LOG_LEVEL="$2"; shift 2 ;;
-      --earthdata_token) EARTHDATA_TOKEN="$2"; shift 2 ;;
+      --earthdata_secret_name) EARTHDATA_SECRET_NAME="$2"; shift 2 ;;
+      --earthdata_token)
+        echo "ERROR: --earthdata_token is no longer accepted (token would appear in DPS logs)." >&2
+        echo "Store the token as a MAAP secret and pass --earthdata_secret_name if needed." >&2
+        echo "  MAAP().secrets.add_secret('EARTHDATA_TOKEN', '<token>')" >&2
+        exit 2
+        ;;
       -h|--help) usage; exit 0 ;;
       *)
         echo "Unknown argument: $1" >&2
@@ -84,21 +96,12 @@ CONFIG="$(trim "$CONFIG")"
 OSM_SOURCE="$(trim "$OSM_SOURCE")"
 WGS84="$(trim "$WGS84")"
 BASENAME="$(trim "$BASENAME")"
-EARTHDATA_TOKEN="$(trim "$EARTHDATA_TOKEN")"
+EARTHDATA_SECRET_NAME="$(trim "$EARTHDATA_SECRET_NAME")"
 LOG_LEVEL="$(trim "$LOG_LEVEL")"
 
 if [[ -z "${BBOX}" || -z "${DATE}" ]]; then
   echo "ERROR: --bbox and --date are required" >&2
   usage >&2
-  exit 1
-fi
-
-if [[ -n "${EARTHDATA_TOKEN}" ]]; then
-  export EARTHDATA_TOKEN
-fi
-
-if [[ -z "${EARTHDATA_TOKEN:-}" ]]; then
-  echo "ERROR: EARTHDATA_TOKEN is not set. Pass --earthdata_token or export EARTHDATA_TOKEN." >&2
   exit 1
 fi
 
@@ -156,12 +159,35 @@ if ! command -v conda >/dev/null 2>&1; then
   exit 127
 fi
 
+# Resolve Earthdata token without putting the secret on the process argv
+export EARTHDATA_SECRET_NAME
+PY_BIN="$(conda run --name "${CONDA_ENV_NAME}" python -c 'import sys; print(sys.executable)')"
+TOKEN_FILE="$(mktemp)"
+chmod 600 "${TOKEN_FILE}"
+cleanup_token_file() { rm -f "${TOKEN_FILE}"; }
+trap cleanup_token_file EXIT
+
+if ! "${PY_BIN}" "${basedir}/resolve_earthdata_token.py" >"${TOKEN_FILE}"; then
+  echo "ERROR: could not resolve Earthdata token via env or MAAP secrets." >&2
+  exit 1
+fi
+EARTHDATA_TOKEN="$(cat "${TOKEN_FILE}")"
+export EARTHDATA_TOKEN
+rm -f "${TOKEN_FILE}"
+trap - EXIT
+
+if [[ -z "${EARTHDATA_TOKEN}" ]]; then
+  echo "ERROR: resolved Earthdata token is empty." >&2
+  exit 1
+fi
+
 echo "Running Black Marble pipeline"
 echo "  bbox=${BBOX}"
 echo "  date=${DATE}"
 echo "  config=${CONFIG}"
 echo "  osm_source=${OSM_SOURCE}"
 echo "  output=${OUTPUT_PATH}"
+echo "  earthdata_secret_name=${EARTHDATA_SECRET_NAME}"
 echo "  conda=$(command -v conda) env=${CONDA_ENV_NAME}"
 
 # Always run via conda (matches MAAP OGC / sardem-sarsen pattern)
