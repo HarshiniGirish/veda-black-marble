@@ -1,13 +1,11 @@
 # OGC Application Package / MAAP DPS algorithm configuration
 # Compatible with MAAP Register Algorithm UI and ogc-app-pack-generator.
-# See: https://github.com/MAAP-Project/ogc-app-pack-generator
 #
-# Earthdata auth uses MAAP Secrets (not a CLI token input).
+# Auth: DPS injects MAAP_PGT; algorithm uses maap-py (no Earthdata token input).
 algorithm_description: >
   VEDA Black Marble nighttime-lights pipeline: combines VIIRS VNP46A2 with
   Landsat and OSM roads to produce urban-focused Cloud-Optimized GeoTIFF
-  imagery for a user bbox and date. Earthdata credentials are loaded from
-  MAAP Secrets (default name EARTHDATA_TOKEN).
+  imagery for a user bbox and date. On MAAP, auth uses maap-py + MAAP_PGT.
 algorithm_name: veda-black-marble
 algorithm_version: main
 keywords: ogc, black-marble, viirs, landsat, nighttime-lights, veda, maap
@@ -17,7 +15,7 @@ citation: https://github.com/HarshiniGirish/veda-black-marble
 author: NASA-IMPACT
 contributor: HarshiniGirish
 license: https://github.com/HarshiniGirish/veda-black-marble/blob/main/LICENSE
-release_notes: OGC/DPS packaging; Earthdata token via MAAP Secrets (not CLI).
+release_notes: OGC/DPS packaging; Earthdata via maap-py/MAAP_PGT (no token CLI).
 docker_container_url: mas.maap-project.org/root/maap-workspaces/custom_images/maap_base:v6.0.0
 disk_space: 40GB
 queue: maap-dps-worker-16gb
@@ -53,12 +51,6 @@ inputs:
       Output filename stem written as output/<basename>.tif
       (maps to blackmarble --output-path).
     label: basename
-    type: string?
-  - name: earthdata_secret_name
-    doc: >
-      MAAP Secrets Manager name that holds the Earthdata token
-      (not the token value). Default EARTHDATA_TOKEN.
-    label: Earthdata secret name
     type: string?
 
 outputs:
