@@ -1,15 +1,16 @@
 """Functions for downloading VIIRS nighttime lights data from NASA LAADS.
 
-On MAAP ADE/DPS, authentication uses the injected MAAP_PGT via maap-py
-(same pattern as OPERA / GEDI DPS algorithms). No Earthdata token CLI arg
-or manual EARTHDATA_TOKEN export is required.
+On MAAP ADE/DPS, authentication uses the injected MAAP_PGT via maap-py.
+Compatible with older maap-py builds that reject cmr_host= / destination_path=.
 
 Local / non-MAAP fallback uses earthaccess (env token or .netrc).
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
+import os
 import warnings
 from copy import deepcopy
 from datetime import datetime
@@ -24,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 
 BM_SHORT_NAME = "VNP46A2"
-# earthaccess accepts "2"; CMR typically wants "002"
 BM_VERSION_EARTHACCESS = "2"
 BM_VERSION_CMR = "002"
 CMR_GRANULES_UMM = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
@@ -64,31 +64,74 @@ def _temporal_str(dt: datetime) -> str:
     return f"{dt:%Y-%m-%d}T00:00:00Z,{dt:%Y-%m-%d}T23:59:59Z"
 
 
-def _call_search_granule(maap: Any, **kwargs: Any) -> list[Any]:
-    """Call searchGranule; older maap-py rejects cmr_host — retry without it."""
+def _filter_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drop kwargs not accepted by fn (older maap-py is strict)."""
     try:
-        return maap.searchGranule(**kwargs)
-    except TypeError as exc:
-        if "cmr_host" not in str(exc) or "cmr_host" not in kwargs:
-            raise
-        logger.warning("maap-py searchGranule rejected cmr_host; retrying without it")
-        kwargs = {k: v for k, v in kwargs.items() if k != "cmr_host"}
-        return maap.searchGranule(**kwargs)
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return kwargs
+    allowed = set(sig.parameters)
+    allowed.discard("self")
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+def _call_search_granule(maap: Any, **kwargs: Any) -> list[Any]:
+    """Call searchGranule with only kwargs supported by the installed maap-py."""
+    fn = maap.searchGranule
+    filtered = _filter_kwargs(fn, kwargs)
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        logger.warning("maap.searchGranule ignoring unsupported kwargs: %s", dropped)
+    return fn(**filtered)
+
+
+def _maap_download_url(maap: Any, url: str, output_dir: Path) -> Path:
+    """Download one HTTPS URL via maap.downloadGranule across API variants."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fn = maap.downloadGranule
+
+    # 1) Keyword forms used by various maap-py versions
+    for key in ("destination_path", "destpath", "dest_path", "outdir"):
+        try:
+            result = fn(url, **{key: str(output_dir)})
+            return Path(result)
+        except TypeError:
+            continue
+
+    # 2) Positional destination (common older style)
+    try:
+        result = fn(url, str(output_dir))
+        return Path(result)
+    except TypeError:
+        pass
+
+    # 3) URL-only API: chdir into output_dir then download
+    prev = Path.cwd()
+    try:
+        os.chdir(output_dir)
+        result = fn(url)
+        path = Path(result)
+        if not path.is_absolute():
+            path = output_dir / path
+        return path
+    finally:
+        os.chdir(prev)
 
 
 def _https_url_from_umm_item(item: dict[str, Any]) -> str | None:
-    """Pick a downloadable HTTPS URL from a CMR UMM-JSON granule item."""
     related = (item.get("umm") or {}).get("RelatedUrls") or []
     https_candidates: list[str] = []
     for entry in related:
-        url = entry.get("URL") if isinstance(entry, dict) else None
-        if not isinstance(url, str):
+        if not isinstance(entry, dict):
             continue
-        if not url.startswith("http"):
+        url = entry.get("URL")
+        if not isinstance(url, str) or not url.startswith("http"):
             continue
-        # Prefer GET DATA links; skip browse/metadata
         utype = str(entry.get("Type", "")).upper()
-        if "GET DATA" in utype or utype in {"GET DATA", "GET DATA VIA DIRECT ACCESS"}:
+        if "GET DATA" in utype:
             return url
         https_candidates.append(url)
     return https_candidates[0] if https_candidates else None
@@ -130,8 +173,23 @@ def _download_via_maap_search(
 
     filelist: list[Path] = []
     for granule in results:
-        path = Path(granule.getData(str(output_dir)))
-        if path.exists():
+        # getData(destpath=...) on modern; positional on some builds
+        path: Path | None = None
+        try:
+            path = Path(granule.getData(str(output_dir)))
+        except TypeError:
+            try:
+                path = Path(granule.getData(destpath=str(output_dir)))
+            except TypeError:
+                prev = Path.cwd()
+                try:
+                    os.chdir(output_dir)
+                    path = Path(granule.getData())
+                    if not path.is_absolute():
+                        path = output_dir / path
+                finally:
+                    os.chdir(prev)
+        if path is not None and path.exists():
             filelist.append(path)
 
     if not filelist:
@@ -179,7 +237,7 @@ def _download_via_cmr_umm_and_maap(
             logger.warning("Skipping granule with no HTTPS URL: %s", item.get("meta"))
             continue
         logger.info("Downloading via maap.downloadGranule: %s", url)
-        local = Path(maap.downloadGranule(url, destination_path=str(output_dir)))
+        local = _maap_download_url(maap, url, output_dir)
         if local.exists():
             filelist.append(local)
 
@@ -191,7 +249,6 @@ def _download_via_cmr_umm_and_maap(
 def _download_via_maap(
     dt: datetime, bbox: tuple[float, float, float, float], output_dir: Path
 ) -> list[Path]:
-    """Search/download VNP46A2 using maap-py (MAAP_PGT). Raises if unavailable."""
     from maap.maap import MAAP
 
     maap = MAAP()
@@ -209,7 +266,6 @@ def _download_via_maap(
 def _download_via_earthaccess(
     dt: datetime, bbox: tuple[float, float, float, float], output_dir: Path
 ) -> list[Path]:
-    """Local / non-MAAP fallback using earthaccess."""
     import earthaccess
 
     logger.info("Logging in to Earthdata via earthaccess (local fallback)...")
@@ -244,10 +300,7 @@ def _download_via_earthaccess(
 def download_viirs(
     dt: datetime, bbox: tuple[float, float, float, float], output_dir: str | Path
 ) -> dict[str, list[Path]]:
-    """Search and download VIIRS VNP46A2 files for a given date and bounding box.
-
-    Prefer maap-py when available (ADE/DPS). Fall back to earthaccess locally.
-    """
+    """Search and download VIIRS VNP46A2 for a date/bbox. Prefer maap-py on DPS."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
