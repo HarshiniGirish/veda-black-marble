@@ -43,5 +43,5 @@ echo "Verifying blackmarble CLI"
 echo "Verifying maap-py import (for MAAP secrets)"
 "${conda}" run --name "${CONDA_ENV_NAME}" python -c "from maap.maap import MAAP; print('maap-py OK')"
 
-chmod +x "${basedir}/run.sh" "${basedir}/build.sh" "${basedir}/resolve_earthdata_token.py" 2>/dev/null || true
+chmod +x "${basedir}/run.sh" "${basedir}/build.sh" 2>/dev/null || true
 echo "Build complete"
