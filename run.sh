@@ -4,14 +4,14 @@ set -euo pipefail
 # MAAP OGC / DPS entrypoint for VEDA Black Marble.
 # Persistable products must land under ./output (DPS convention).
 #
-# Earthdata auth: DO NOT pass the token on the CLI (it appears in DPS job logs).
-# Resolve via MAAP Secrets (maap-py) or an already-exported EARTHDATA_TOKEN env var.
+# Auth: DPS injects MAAP_PGT. blackmarble/acquire/viirs.py uses maap-py.
+# Do NOT pass Earthdata tokens on the CLI (they appear in job logs).
 #
-# Named flags (OGC app pack / local):
+# Named flags:
 #   ./run.sh --bbox "-122.55,37.69,-122.32,37.81" --date 2023-06-15
 #
-# Positional (MAAP Register Algorithm UI / DPS):
-#   ./run.sh <bbox> <date> [config] [osm_source] [wgs84] [basename] [earthdata_secret_name]
+# Positional (Register Algorithm UI / DPS):
+#   ./run.sh <bbox> <date> [config] [osm_source] [wgs84] [basename]
 
 basedir=$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)
 
@@ -24,9 +24,7 @@ OSM_SOURCE="overpass"
 WGS84="false"
 BASENAME="black_marble_output"
 LOG_LEVEL="INFO"
-EARTHDATA_SECRET_NAME="${EARTHDATA_SECRET_NAME:-EARTHDATA_TOKEN}"
 
-# Trim leading/trailing whitespace (DPS/CWL sometimes adds spaces)
 trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -38,20 +36,16 @@ usage() {
   cat <<EOF
 Usage:
   $(basename "$0") --bbox MINX,MINY,MAXX,MAXY --date YYYY-MM-DD [options...]
-  $(basename "$0") <bbox> <date> [config] [osm_source] [wgs84] [basename] [earthdata_secret_name]
+  $(basename "$0") <bbox> <date> [config] [osm_source] [wgs84] [basename]
 
 Options:
-  --bbox BBOX                    WGS84 bbox: min_lon,min_lat,max_lon,max_lat
-  --date YYYY-MM-DD              Target date
-  --config PRESET                default | high_quality | fast  [default: fast]
-  --osm_source SRC               overpass | layercake           [default: overpass]
-  --wgs84 true|false             Also export EPSG:4326          [default: false]
-  --basename NAME                Output filename stem → output/NAME.tif
-                                 (maps to blackmarble --output-path)
-  --log_level LEVEL              DEBUG|INFO|WARNING|ERROR       [default: INFO]
-  --earthdata_secret_name NAME   MAAP secret name holding the Earthdata token
-                                 [default: EARTHDATA_TOKEN]
-                                 Never pass the token value itself on the CLI.
+  --bbox BBOX           WGS84 bbox: min_lon,min_lat,max_lon,max_lat
+  --date YYYY-MM-DD     Target date
+  --config PRESET       default | high_quality | fast  [default: fast]
+  --osm_source SRC      overpass | layercake           [default: overpass]
+  --wgs84 true|false    Also export EPSG:4326          [default: false]
+  --basename NAME       Output stem → output/NAME.tif  (maps to --output-path)
+  --log_level LEVEL     DEBUG|INFO|WARNING|ERROR       [default: INFO]
 EOF
 }
 
@@ -62,7 +56,6 @@ if [[ $# -gt 0 && "${1}" != --* ]]; then
   OSM_SOURCE="${4:-$OSM_SOURCE}"
   WGS84="${5:-$WGS84}"
   BASENAME="${6:-$BASENAME}"
-  EARTHDATA_SECRET_NAME="${7:-$EARTHDATA_SECRET_NAME}"
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -73,11 +66,8 @@ else
       --wgs84) WGS84="$2"; shift 2 ;;
       --basename) BASENAME="$2"; shift 2 ;;
       --log_level) LOG_LEVEL="$2"; shift 2 ;;
-      --earthdata_secret_name) EARTHDATA_SECRET_NAME="$2"; shift 2 ;;
-      --earthdata_token)
-        echo "ERROR: --earthdata_token is no longer accepted (token would appear in DPS logs)." >&2
-        echo "Store the token as a MAAP secret and pass --earthdata_secret_name if needed." >&2
-        echo "  MAAP().secrets.add_secret('EARTHDATA_TOKEN', '<token>')" >&2
+      --earthdata_token|--earthdata_secret_name)
+        echo "ERROR: $1 is not accepted. Auth uses MAAP_PGT via maap-py inside the algorithm." >&2
         exit 2
         ;;
       -h|--help) usage; exit 0 ;;
@@ -96,7 +86,6 @@ CONFIG="$(trim "$CONFIG")"
 OSM_SOURCE="$(trim "$OSM_SOURCE")"
 WGS84="$(trim "$WGS84")"
 BASENAME="$(trim "$BASENAME")"
-EARTHDATA_SECRET_NAME="$(trim "$EARTHDATA_SECRET_NAME")"
 LOG_LEVEL="$(trim "$LOG_LEVEL")"
 
 if [[ -z "${BBOX}" || -z "${DATE}" ]]; then
@@ -120,14 +109,11 @@ ARGS=(
 )
 
 case "${WGS84}" in
-  true|TRUE|1|yes|YES)
-    ARGS+=(--wgs84)
-    ;;
+  true|TRUE|1|yes|YES) ARGS+=(--wgs84) ;;
 esac
 
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-notebook}"
 
-# Initialize conda for non-interactive DPS/CWL shells (login profile is often skipped)
 if ! command -v conda >/dev/null 2>&1; then
   for candidate in \
     "${CONDA_EXE:-}" \
@@ -151,34 +137,8 @@ if ! command -v conda >/dev/null 2>&1; then
 fi
 
 if ! command -v conda >/dev/null 2>&1; then
-  echo "ERROR: conda not found in PATH. Checked common MAAP locations." >&2
-  echo "PATH=${PATH}" >&2
-  type -a conda 2>&1 || true
-  ls /opt/conda/bin 2>&1 | head || true
-  ls /srv/conda/bin 2>&1 | head || true
+  echo "ERROR: conda not found in PATH." >&2
   exit 127
-fi
-
-# Resolve Earthdata token without putting the secret on the process argv
-export EARTHDATA_SECRET_NAME
-PY_BIN="$(conda run --name "${CONDA_ENV_NAME}" python -c 'import sys; print(sys.executable)')"
-TOKEN_FILE="$(mktemp)"
-chmod 600 "${TOKEN_FILE}"
-cleanup_token_file() { rm -f "${TOKEN_FILE}"; }
-trap cleanup_token_file EXIT
-
-if ! "${PY_BIN}" "${basedir}/resolve_earthdata_token.py" >"${TOKEN_FILE}"; then
-  echo "ERROR: could not resolve Earthdata token via env or MAAP secrets." >&2
-  exit 1
-fi
-EARTHDATA_TOKEN="$(cat "${TOKEN_FILE}")"
-export EARTHDATA_TOKEN
-rm -f "${TOKEN_FILE}"
-trap - EXIT
-
-if [[ -z "${EARTHDATA_TOKEN}" ]]; then
-  echo "ERROR: resolved Earthdata token is empty." >&2
-  exit 1
 fi
 
 echo "Running Black Marble pipeline"
@@ -187,10 +147,8 @@ echo "  date=${DATE}"
 echo "  config=${CONFIG}"
 echo "  osm_source=${OSM_SOURCE}"
 echo "  output=${OUTPUT_PATH}"
-echo "  earthdata_secret_name=${EARTHDATA_SECRET_NAME}"
 echo "  conda=$(command -v conda) env=${CONDA_ENV_NAME}"
 
-# Always run via conda (matches MAAP OGC / sardem-sarsen pattern)
 conda run --live-stream --name "${CONDA_ENV_NAME}" \
   blackmarble "${ARGS[@]}"
 
