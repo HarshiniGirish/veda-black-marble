@@ -13,7 +13,6 @@ import typer
 from .config import PipelineConfig
 from .pipeline import pipeline
 
-
 app = typer.Typer(help="Command-line interface for the VEDA Black Marble processing pipeline.")
 
 
@@ -59,8 +58,8 @@ def run(
         typer.Option(
             "--earthdata-token",
             "-t",
-            help="NASA Earthdata token for VIIRS downloads. "
-            "If not provided, reads from EARTHDATA_TOKEN environment variable.",
+            help="Optional NASA Earthdata token for local earthaccess fallback. "
+            "Not required on MAAP ADE/DPS (uses maap-py / MAAP_PGT).",
         ),
     ] = None,
     output_path: Annotated[
@@ -91,7 +90,7 @@ def run(
         typer.Option(
             "--save-diagnostics",
             "-d",
-            help="Save diagnostic intermediate outputs to <data-dir>/diagnostics/",
+            help="Save diagnostic intermediate outputs to /diagnostics/",
         ),
     ] = False,
     wgs84: Annotated[
@@ -145,24 +144,19 @@ def run(
     logging.getLogger("aiobotocore").setLevel(logging.WARNING)
     logging.getLogger("botocore").setLevel(logging.WARNING)
     logging.getLogger("boto3").setLevel(logging.WARNING)
-    # supress logs from earthaccess, rasterio, and rasterio
+    # suppress logs from earthaccess and rasterio
     logging.getLogger("earthaccess").setLevel(logging.WARNING)
     logging.getLogger("rasterio").setLevel(logging.ERROR)
 
     bbox_parsed = typing.cast(tuple[float, float, float, float], bbox)
 
-    # Resolve token from CLI option first, then explicit environment fallback
-    resolved_earthdata_token = earthdata_token or str(os.getenv("EARTHDATA_TOKEN")).strip()
-
-    # Set as environment variable for downstream compatibility
-    if resolved_earthdata_token:
-        os.environ["EARTHDATA_TOKEN"] = resolved_earthdata_token.strip()
+    # Optional: local earthaccess fallback only.
+    # On MAAP ADE/DPS, VIIRS auth uses maap-py + injected MAAP_PGT (no token required).
+    resolved_earthdata_token = (earthdata_token or os.getenv("EARTHDATA_TOKEN") or "").strip()
+    if resolved_earthdata_token and resolved_earthdata_token != "None":
+        os.environ["EARTHDATA_TOKEN"] = resolved_earthdata_token
     else:
-        typer.echo(
-            "Error: EARTHDATA_TOKEN env var not set or --earthdata-token not provided.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+        os.environ.pop("EARTHDATA_TOKEN", None)
 
     # Ensure output directory exists (only for local paths)
     if not output_path.startswith("s3://"):
@@ -217,7 +211,9 @@ def run(
             err=True,
         )
         raise typer.Exit(code=1)
-    config.acquisition.osm_source = typing.cast(typing.Literal["overpass", "layercake"], osm_source_normalized)
+    config.acquisition.osm_source = typing.cast(
+        typing.Literal["overpass", "layercake"], osm_source_normalized
+    )
 
     typer.echo("🌃 NTL enhancement: Urban field (multiplicative mode)")
     typer.echo(f"   Urban field scales: {config.analysis.urban_field_sigmas} pixels")
@@ -258,7 +254,7 @@ def run(
         # Display validation info
         validation = result.get("validation", {})
         if validation and not validation.get("valid", True):
-            typer.echo(f"\n⚠️  Validation warnings: {validation.get('errors', [])}")
+            typer.echo(f"\n⚠️ Validation warnings: {validation.get('errors', [])}")
 
     except Exception as e:
         typer.echo(f"\n❌ Pipeline failed: {str(e)}", err=True)
