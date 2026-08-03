@@ -14,6 +14,7 @@ import warnings
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import rasterio
 from rasterio.errors import NotGeoreferencedWarning
@@ -23,9 +24,10 @@ logger = logging.getLogger(__name__)
 
 
 BM_SHORT_NAME = "VNP46A2"
-# earthaccess accepts "2"; CMR/maap-py typically wants "002"
+# earthaccess accepts "2"; CMR typically wants "002"
 BM_VERSION_EARTHACCESS = "2"
 BM_VERSION_CMR = "002"
+CMR_GRANULES_UMM = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 
 NTL_DATASET_PATH = (
     "HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data_Fields/Gap_Filled_DNB_BRDF-Corrected_NTL"
@@ -58,6 +60,134 @@ def _bbox_str(bbox: tuple[float, float, float, float]) -> str:
     return ",".join(str(v) for v in bbox)
 
 
+def _temporal_str(dt: datetime) -> str:
+    return f"{dt:%Y-%m-%d}T00:00:00Z,{dt:%Y-%m-%d}T23:59:59Z"
+
+
+def _call_search_granule(maap: Any, **kwargs: Any) -> list[Any]:
+    """Call searchGranule; older maap-py rejects cmr_host — retry without it."""
+    try:
+        return maap.searchGranule(**kwargs)
+    except TypeError as exc:
+        if "cmr_host" not in str(exc) or "cmr_host" not in kwargs:
+            raise
+        logger.warning("maap-py searchGranule rejected cmr_host; retrying without it")
+        kwargs = {k: v for k, v in kwargs.items() if k != "cmr_host"}
+        return maap.searchGranule(**kwargs)
+
+
+def _https_url_from_umm_item(item: dict[str, Any]) -> str | None:
+    """Pick a downloadable HTTPS URL from a CMR UMM-JSON granule item."""
+    related = (item.get("umm") or {}).get("RelatedUrls") or []
+    https_candidates: list[str] = []
+    for entry in related:
+        url = entry.get("URL") if isinstance(entry, dict) else None
+        if not isinstance(url, str):
+            continue
+        if not url.startswith("http"):
+            continue
+        # Prefer GET DATA links; skip browse/metadata
+        utype = str(entry.get("Type", "")).upper()
+        if "GET DATA" in utype or utype in {"GET DATA", "GET DATA VIA DIRECT ACCESS"}:
+            return url
+        https_candidates.append(url)
+    return https_candidates[0] if https_candidates else None
+
+
+def _download_via_maap_search(
+    maap: Any, dt: datetime, bbox: tuple[float, float, float, float], output_dir: Path
+) -> list[Path]:
+    temporal = _temporal_str(dt)
+    bbox_csv = _bbox_str(bbox)
+
+    results: list[Any] = []
+    for version in (BM_VERSION_CMR, BM_VERSION_EARTHACCESS):
+        logger.info(
+            "Searching VIIRS via maap.searchGranule short_name=%s version=%s",
+            BM_SHORT_NAME,
+            version,
+        )
+        results = _call_search_granule(
+            maap,
+            short_name=BM_SHORT_NAME,
+            version=version,
+            temporal=temporal,
+            bounding_box=bbox_csv,
+            limit=100,
+            cmr_host="cmr.earthdata.nasa.gov",
+        )
+        if results:
+            break
+
+    if not results:
+        raise RuntimeError(
+            f"No {BM_SHORT_NAME} granules from maap.searchGranule for "
+            f"date={dt:%Y-%m-%d} bbox={bbox_csv}"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading %d VIIRS granule(s) via granule.getData...", len(results))
+
+    filelist: list[Path] = []
+    for granule in results:
+        path = Path(granule.getData(str(output_dir)))
+        if path.exists():
+            filelist.append(path)
+
+    if not filelist:
+        raise RuntimeError("maap.searchGranule succeeded but no files were downloaded")
+    return filelist
+
+
+def _download_via_cmr_umm_and_maap(
+    maap: Any, dt: datetime, bbox: tuple[float, float, float, float], output_dir: Path
+) -> list[Path]:
+    """Direct NASA CMR search + maap.downloadGranule (uses MAAP_PGT on DPS)."""
+    import requests
+
+    bbox_csv = _bbox_str(bbox)
+    temporal = _temporal_str(dt)
+    items: list[dict[str, Any]] = []
+
+    for version in (BM_VERSION_CMR, BM_VERSION_EARTHACCESS):
+        params = {
+            "short_name": BM_SHORT_NAME,
+            "version": version,
+            "temporal": temporal,
+            "bounding_box": bbox_csv,
+            "page_size": "100",
+        }
+        logger.info("Searching VIIRS via CMR UMM-JSON version=%s", version)
+        resp = requests.get(CMR_GRANULES_UMM, params=params, timeout=120)
+        resp.raise_for_status()
+        items = list(resp.json().get("items") or [])
+        if items:
+            break
+
+    if not items:
+        raise RuntimeError(
+            f"No {BM_SHORT_NAME} granules from CMR UMM-JSON for "
+            f"date={dt:%Y-%m-%d} bbox={bbox_csv}"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filelist: list[Path] = []
+
+    for item in items:
+        url = _https_url_from_umm_item(item)
+        if not url:
+            logger.warning("Skipping granule with no HTTPS URL: %s", item.get("meta"))
+            continue
+        logger.info("Downloading via maap.downloadGranule: %s", url)
+        local = Path(maap.downloadGranule(url, destination_path=str(output_dir)))
+        if local.exists():
+            filelist.append(local)
+
+    if not filelist:
+        raise RuntimeError("CMR UMM search succeeded but no files were downloaded")
+    return filelist
+
+
 def _download_via_maap(
     dt: datetime, bbox: tuple[float, float, float, float], output_dir: Path
 ) -> list[Path]:
@@ -65,49 +195,15 @@ def _download_via_maap(
     from maap.maap import MAAP
 
     maap = MAAP()
-    temporal = f"{dt:%Y-%m-%d}T00:00:00Z,{dt:%Y-%m-%d}T23:59:59Z"
-    bbox_csv = _bbox_str(bbox)
 
-    logger.info("Searching VIIRS via maap-py (MAAP auth)...")
-    results = maap.searchGranule(
-        cmr_host="cmr.earthdata.nasa.gov",
-        short_name=BM_SHORT_NAME,
-        version=BM_VERSION_CMR,
-        temporal=temporal,
-        bounding_box=bbox_csv,
-        limit=100,
-    )
-
-    if not results:
-        # Some CMR records use version "2" instead of "002"
-        results = maap.searchGranule(
-            cmr_host="cmr.earthdata.nasa.gov",
-            short_name=BM_SHORT_NAME,
-            version=BM_VERSION_EARTHACCESS,
-            temporal=temporal,
-            bounding_box=bbox_csv,
-            limit=100,
+    try:
+        return _download_via_maap_search(maap, dt, bbox, output_dir)
+    except Exception as search_exc:  # noqa: BLE001
+        logger.warning(
+            "maap.searchGranule/getData path failed (%s); trying CMR UMM + downloadGranule",
+            search_exc,
         )
-
-    if not results:
-        raise RuntimeError(
-            f"No {BM_SHORT_NAME} granules found via maap-py for "
-            f"date={dt:%Y-%m-%d} bbox={bbox_csv}"
-        )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading %d VIIRS granule(s) via maap-py getData...", len(results))
-
-    filelist: list[Path] = []
-    for granule in results:
-        path = Path(granule.getData(str(output_dir)))
-        if path.suffix.lower() in {".h5", ".hdf", ".hdf5"} or path.exists():
-            filelist.append(path)
-
-    if not filelist:
-        raise RuntimeError("maap-py search succeeded but no files were downloaded")
-
-    return filelist
+        return _download_via_cmr_umm_and_maap(maap, dt, bbox, output_dir)
 
 
 def _download_via_earthaccess(
@@ -117,7 +213,6 @@ def _download_via_earthaccess(
     import earthaccess
 
     logger.info("Logging in to Earthdata via earthaccess (local fallback)...")
-    # Prefer env/.netrc; never prompt in DPS/non-interactive shells
     auth = earthaccess.login(strategy="environment")
     if not auth:
         auth = earthaccess.login(strategy="netrc")
@@ -164,7 +259,7 @@ def download_viirs(
         logger.info("VIIRS download completed via maap-py (%d file(s))", len(filelist))
     except ImportError:
         logger.info("maap-py not installed; using earthaccess fallback")
-    except Exception as exc:  # noqa: BLE001 — fall back for any MAAP/CMR failure
+    except Exception as exc:  # noqa: BLE001
         maap_error = exc
         logger.warning("maap-py VIIRS download failed (%s); trying earthaccess", exc)
 
